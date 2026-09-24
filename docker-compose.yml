@@ -1,0 +1,24 @@
+services:
+  coldchain-api:
+    build: .
+    image: coldchain-api:latest
+    container_name: coldchain-api
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      # 默认使用容器内 SQLite；也可替换为其他 SQLAlchemy 连接串
+      DATABASE_URL: "${DATABASE_URL:-sqlite:///./data/coldchain.db}"
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+    volumes:
+      - coldchain-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  coldchain-data:
