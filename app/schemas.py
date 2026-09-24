@@ -1,7 +1,7 @@
 """Pydantic 请求/响应模型。"""
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EventIn(BaseModel):
@@ -175,4 +175,110 @@ class TemperatureMedianResult(BaseModel):
             "时间加权温度中位数（℃）：累计时长占比首次达到一半的最低温度；"
             "无有效段时为 null"
         ),
+    )
+
+
+# 交接快照结论：缺报 / 越界（低于下限或高于上限）/ 正常（含恰等边界值）
+CONCLUSION_MISSING = "missing"
+CONCLUSION_OUT_OF_RANGE = "out_of_range"
+CONCLUSION_NORMAL = "normal"
+
+
+class HandoffIn(BaseModel):
+    handoff_no: str = Field(
+        ..., min_length=1, max_length=64, description="交接编号（业务唯一）"
+    )
+    box_codes: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        description="本次交接涉及的箱号列表（不能为空、不能重复，顺序即冻结明细顺序）",
+    )
+    temp_lower: float = Field(
+        ..., allow_inf_nan=False, description="温度下限（℃），不得高于上限"
+    )
+    temp_upper: float = Field(
+        ..., allow_inf_nan=False, description="温度上限（℃），不得低于下限"
+    )
+
+    @field_validator("handoff_no")
+    @classmethod
+    def _strip_handoff_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("handoff_no 不能为空")
+        return v
+
+    @field_validator("box_codes")
+    @classmethod
+    def _normalize_box_codes(cls, values: list[str]) -> list[str]:
+        # 去空白；空箱号拒绝，重复箱号拒绝（区分大小写）
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            code = raw.strip()
+            if not code:
+                raise ValueError("箱号不能为空")
+            if len(code) > 64:
+                raise ValueError(f"箱号长度不能超过 64 个字符：{code}")
+            if code in seen:
+                raise ValueError(f"箱号重复：{code}")
+            seen.add(code)
+            normalized.append(code)
+        return normalized
+
+    @model_validator(mode="after")
+    def _check_limits(self) -> "HandoffIn":
+        if self.temp_lower > self.temp_upper:
+            raise ValueError(
+                f"温度下限({self.temp_lower}) 不能高于温度上限({self.temp_upper})"
+            )
+        return self
+
+
+class HandoffItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    box_code: str = Field(..., description="周转箱箱号")
+    seq: int | None = Field(
+        ..., description="冻结时该箱的最大事件序号；缺报为 null"
+    )
+    temperature: float | None = Field(
+        ..., description="冻结时该箱最大序号事件的温度（℃）；缺报为 null"
+    )
+    event_time: datetime | None = Field(
+        ..., description="冻结时该箱最大序号事件的 UTC 时间；缺报为 null"
+    )
+    conclusion: str = Field(
+        ...,
+        description=(
+            "结论：missing=缺报（库中无该箱事件）；"
+            "out_of_range=越界（严格低于下限或高于上限）；"
+            "normal=正常（闭区间内，恰等边界值也算正常）"
+        ),
+    )
+
+
+class HandoffSummary(BaseModel):
+    total: int = Field(..., description="明细箱数合计（= 各类数量之和）")
+    missing: int = Field(..., description="缺报箱数量")
+    out_of_range: int = Field(..., description="越界箱数量")
+    normal: int = Field(..., description="正常箱数量（含恰等上下限的边界值）")
+
+
+class HandoffSnapshot(BaseModel):
+    handoff_no: str = Field(..., description="交接编号")
+    temp_lower: float = Field(..., description="冻结的温度下限（℃）")
+    temp_upper: float = Field(..., description="冻结的温度上限（℃）")
+    created_at: datetime = Field(..., description="快照创建时间（UTC）")
+    items: list[HandoffItemOut] = Field(
+        ..., description="冻结明细，按请求箱号顺序排列"
+    )
+    summary: HandoffSummary = Field(..., description="各类结论数量")
+
+
+class HandoffAck(HandoffSnapshot):
+    status: str = Field(
+        ...,
+        description="accepted=首次创建快照，duplicate=同编号同内容重放（返回原快照，不重建）",
     )

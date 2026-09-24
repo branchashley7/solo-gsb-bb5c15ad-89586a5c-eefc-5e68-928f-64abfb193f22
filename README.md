@@ -8,6 +8,9 @@
 - **相同箱号 + 相同序号但内容不同** → 拒绝（HTTP `409 Conflict`）。
 - **乱序/延迟事件**（序号先到 3 后到 1、中间跳号等）→ 正常入库；
   查询“最新状态”时始终取每个箱子**序号最大**的一条，与到达顺序无关。
+- **交接快照**（`POST /handoffs`）：按交接编号在**同一事务**中冻结各箱交接时点的
+  最大序号状态（序号、温度、事件时间与缺报/越界/正常结论）。快照一经建立，
+  后续乱序补报**不得改写**；同编号同内容重放返回原快照，内容不同返回 `409`。
 
 ## 目录结构
 
@@ -17,9 +20,9 @@
 │   ├── __init__.py
 │   ├── config.py          # 环境变量配置
 │   ├── database.py        # 引擎/会话，启动建表
-│   ├── models.py          # BoxEvent 模型，(box_code, seq) 唯一约束
+│   ├── models.py          # BoxEvent / Handoff / HandoffItem 模型
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -29,9 +32,16 @@
 
 ## 一键启动（Docker Compose）
 
+在仓库根目录执行**一条命令**即可构建镜像、建表并在 `http://localhost:8000` 启动服务：
+
 ```bash
 docker compose up -d --build
 ```
+
+随后即可访问：
+
+- 健康检查：`curl http://localhost:8000/health`
+- Swagger 交互文档：<http://localhost:8000/docs>
 
 启动过程会自动完成：
 
@@ -89,6 +99,8 @@ APP_PORT=9000 docker compose up -d --build
 | ---- | ----------------------------- | -------------------------------------- |
 | GET  | `/health`                     | 健康检查                               |
 | POST | `/events`                     | 上报一个事件（幂等，支持设备重试）     |
+| POST | `/handoffs`                   | 创建/幂等重放交接快照（同事务冻结各箱最大序号状态） |
+| GET  | `/handoffs/{handoff_no}`      | 按交接编号读取冻结快照明细与各类数量   |
 | GET  | `/states`                     | 所有箱子的最新状态（按最大序号）       |
 | GET  | `/boxes`                      | 所有上报过的箱号                       |
 | GET  | `/boxes/{box_code}/state`     | 单个箱子的最新状态                     |
@@ -154,6 +166,105 @@ curl -X POST http://localhost:8000/events \
 # 乱序补报 seq=0 / seq=2 ... 最新状态始终取最大 seq
 curl http://localhost:8000/boxes/BOX-001/state
 curl http://localhost:8000/states
+```
+
+## 交接快照（handoffs）
+
+交接（如冷库入库、承运商换车）时需要一份**冻结**的当时状态清单。
+`POST /handoffs` 接收交接编号、箱号列表及温度上下限，在**同一数据库事务**中：
+
+1. 校验：箱号列表**不能为空、不能重复**；`temp_lower <= temp_upper`
+   （上下限必须是有限数值），不满足返回 `422`。
+2. 按各箱**当前最大 seq** 读取状态（乱序安全，缺号不影响），逐箱冻结
+   **序号、温度、事件时间**与结论：
+   - 库中从无该箱事件 → `missing`（缺报，序号/温度/时间为 `null`）；
+   - 温度**严格**低于下限或高于上限 → `out_of_range`（越界）；
+   - 温度在闭区间 `[temp_lower, temp_upper]` 内 → `normal`，
+     **恰等下限/上限的边界值算正常**。
+3. 主表 + 明细一次提交。快照只写一次：**后续乱序补报进入事件表，不回写快照**。
+
+交接编号的幂等与冲突语义：
+
+- 编号不存在 → 创建快照，`201 Created`，`status="accepted"`；
+- 编号已存在且**内容一致**（温度上下限相同、箱号集合相同，箱号顺序不影响）
+  → 返回**原快照**，`200 OK`，`status="duplicate"`，冻结值与创建时间均不变；
+- 编号已存在但**内容不同**（箱号增减或上下限变化）→ `409 Conflict`，
+  响应体带库中已有内容与本次内容，且**不会改动原快照**。
+
+`GET /handoffs/{handoff_no}` 返回冻结明细（按请求箱号顺序）与
+`summary` 各类数量（`total = missing + out_of_range + normal`）；编号不存在返回 `404`。
+
+```bash
+# 先上报几箱（UTC）
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-H1","seq":0,"temperature":-4.5,"event_time":"2026-09-24T02:00:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-H1","seq":1,"temperature":-4.2,"event_time":"2026-09-24T02:01:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-H2","seq":0,"temperature":9.0,"event_time":"2026-09-24T02:00:00+00:00"}'
+# BOX-H3 不上报 -> 缺报
+
+# 创建交接快照：下限 0℃、上限 8℃，边界值算正常
+curl -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_no":"HAND-2026-001",
+       "box_codes":["BOX-H1","BOX-H2","BOX-H3"],
+       "temp_lower":0,"temp_upper":8}'
+```
+
+响应（BOX-H1 正常且冻结最大序号 seq=1；BOX-H2 越界；BOX-H3 缺报）：
+
+```json
+{
+  "status": "accepted",
+  "handoff_no": "HAND-2026-001",
+  "temp_lower": 0.0,
+  "temp_upper": 8.0,
+  "created_at": "2026-09-24T02:05:00.123456",
+  "items": [
+    {"box_code": "BOX-H1", "seq": 1, "temperature": -4.2,
+     "event_time": "2026-09-24T02:01:00", "conclusion": "out_of_range"},
+    {"box_code": "BOX-H2", "seq": 0, "temperature": 9.0,
+     "event_time": "2026-09-24T02:00:00", "conclusion": "out_of_range"},
+    {"box_code": "BOX-H3", "seq": null, "temperature": null,
+     "event_time": null, "conclusion": "missing"}
+  ],
+  "summary": {"total": 3, "missing": 1, "out_of_range": 2, "normal": 0}
+}
+```
+
+> 说明：上例下限取 `0` 仅为演示越界；冷链常见区间如 `-18 ~ -2`，
+> 恰等 `-18` 或 `-2` 的箱子均记 `normal`。
+
+```bash
+# 同编号同内容重放（即使调整箱号顺序）-> 200 duplicate，返回原快照
+curl -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_no":"HAND-2026-001",
+       "box_codes":["BOX-H3","BOX-H2","BOX-H1"],
+       "temp_lower":0,"temp_upper":8}'
+
+# 同编号内容不同（改上限/增减箱号）-> 409，原快照不变
+curl -i -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_no":"HAND-2026-001",
+       "box_codes":["BOX-H1","BOX-H2","BOX-H3"],
+       "temp_lower":0,"temp_upper":7}'
+
+# 读取冻结明细
+curl http://localhost:8000/handoffs/HAND-2026-001
+
+# 编号不存在 -> 404
+curl -i http://localhost:8000/handoffs/NO-SUCH
+
+# 乱序补报只影响实时状态，不改写已建快照：
+# 给 BOX-H3 补报、给 BOX-H1 补 seq=9 后再 GET，HAND-2026-001 仍是上面的冻结值
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-H3","seq":0,"temperature":-5.0,"event_time":"2026-09-24T03:00:00+00:00"}'
+curl http://localhost:8000/handoffs/HAND-2026-001
+
+# 箱号重复 / 下限高于上限 / 空箱号列表 / NaN -> 422
+curl -i -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_no":"H-BAD","box_codes":["BOX-H1","BOX-H1"],"temp_lower":0,"temp_upper":8}'
+curl -i -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_no":"H-BAD","box_codes":["BOX-H1"],"temp_lower":8,"temp_upper":0}'
 ```
 
 ## 时钟回拨校正（clock-audit）
@@ -705,3 +816,11 @@ curl -i 'http://localhost:8000/boxes/BOX-MK/merkle-proof?seq_from=5&seq_to=2&tar
 - **持久化**：默认 SQLite + WAL，卷挂载于 `/app/data`；
   如需 PostgreSQL/MySQL，只需将 `DATABASE_URL` 换成对应 SQLAlchemy 连接串
   （并安装相应驱动），建表逻辑通用。
+- **交接快照冻结**：`handoffs`（交接编号唯一）与 `handoffs_items`
+  （每箱一行，外键级联）在**同一事务**内完成“读各箱最大序号状态 + 写主表/明细”，
+  读到的就是该事务时点的状态；缺报箱三列状态字段为 NULL、结论 `missing`，
+  越界按严格越出闭区间判定（边界值正常）。快照表此后不再被任何事件写路径触碰，
+  因此乱序/延迟补报只会改变实时最新状态，**天然无法改写已建快照**。
+  同编号重放按“上下限相同且箱号集合相同”判为内容一致（箱号顺序无关），
+  命中即返回原快照；内容冲突返回 409。`handoff_no` 的唯一约束同时兜住并发创建：
+  捕获 `IntegrityError` 后以库中快照为准重新判定（一致→幂等返回，不一致→409）。

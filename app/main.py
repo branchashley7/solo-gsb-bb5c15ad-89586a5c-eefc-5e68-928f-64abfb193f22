@@ -1,8 +1,11 @@
 """FastAPI 入口与路由。"""
+import math
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from . import models, schemas, services
@@ -18,6 +21,21 @@ async def lifespan(app: FastAPI):
     yield
 
 
+def _json_safe(value):
+    """把错误详情里的 NaN/Infinity 与异常对象替换为可 JSON 序列化的值。"""
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    if isinstance(value, BaseException):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 app = FastAPI(
     title="冷链周转箱事件接收 API",
     description=(
@@ -25,15 +43,63 @@ app = FastAPI(
         "- 相同箱号 + 相同序号 + 相同内容：重复上报，幂等忽略（200，status=duplicate）\n"
         "- 相同箱号 + 相同序号但内容不同：拒绝（409）\n"
         "- 乱序事件正常入库，最新状态始终按最大序号返回\n"
+        "- POST /handoffs 在同一事务中冻结交接时点每箱最大序号状态，"
+        "快照一经建立，后续乱序补报不得改写"
     ),
     version="1.0.0",
     lifespan=lifespan,
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(request: Request, exc: RequestValidationError):
+    # 默认处理器会原样回显非法入参；若入参含 NaN/Infinity，标准 JSON 无法渲染，
+    # 这里用 pydantic 序列化错误后再把非有限浮点净化为字符串，统一返回 422
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": _json_safe(exc.errors())},
+    )
+
+
 @app.get("/health", tags=["system"], summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.post(
+    "/handoffs",
+    tags=["handoffs"],
+    response_model=schemas.HandoffAck,
+    summary="创建/幂等重放交接快照（同一事务冻结各箱最大序号状态）",
+)
+def post_handoff(
+    payload: schemas.HandoffIn, db: DbSession, response: Response
+) -> schemas.HandoffAck:
+    snapshot, duplicate = services.create_handoff(db, payload)
+    # 首次冻结 201；同编号同内容重放 200，返回原快照
+    response.status_code = (
+        status.HTTP_200_OK if duplicate else status.HTTP_201_CREATED
+    )
+    return schemas.HandoffAck(
+        status="duplicate" if duplicate else "accepted",
+        **snapshot.model_dump(),
+    )
+
+
+@app.get(
+    "/handoffs/{handoff_no}",
+    tags=["handoffs"],
+    response_model=schemas.HandoffSnapshot,
+    summary="按交接编号读取冻结快照明细与各类数量",
+)
+def get_handoff(handoff_no: str, db: DbSession) -> schemas.HandoffSnapshot:
+    snapshot = services.get_handoff(db, handoff_no.strip())
+    if snapshot is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "handoff_not_found", "handoff_no": handoff_no},
+        )
+    return snapshot
 
 
 @app.post(
