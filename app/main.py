@@ -1,8 +1,12 @@
 """FastAPI 入口与路由。"""
+import math
 from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from . import models, schemas, services
@@ -25,10 +29,36 @@ app = FastAPI(
         "- 相同箱号 + 相同序号 + 相同内容：重复上报，幂等忽略（200，status=duplicate）\n"
         "- 相同箱号 + 相同序号但内容不同：拒绝（409）\n"
         "- 乱序事件正常入库，最新状态始终按最大序号返回\n"
+        "- 交接快照：POST /handoffs 在同一事务中冻结各箱当前状态；"
+        "同编号同内容幂等返回原快照，内容不同拒绝（409）；快照只读，不受后续补报影响\n"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
+
+
+def _json_safe(value):
+    """递归把 NaN/Inf 替换为字符串。
+
+    Starlette 的 JSONResponse 不允许非有限浮点；请求体里带 NaN/Infinity 时，
+    校验错误的 input 会带上这些值，若不替换，422 响应自身序列化失败变成 500。
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation(request, exc: RequestValidationError) -> JSONResponse:
+    # 与 FastAPI 默认处理一致（422 + detail），仅先把错误详情中的 NaN/Inf 转为字符串
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content=jsonable_encoder({"detail": _json_safe(exc.errors())}),
+    )
 
 
 @app.get("/health", tags=["system"], summary="健康检查")
@@ -111,6 +141,65 @@ def get_box_events(box_code: str, db: DbSession) -> list[schemas.EventOut]:
     if not events:
         raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
     return [schemas.EventOut.model_validate(e) for e in events]
+
+
+def _handoff_out(
+    snapshot: models.HandoffSnapshot, items: list[models.HandoffSnapshotItem]
+) -> schemas.HandoffOut:
+    return schemas.HandoffOut(
+        handoff_code=snapshot.handoff_code,
+        temp_lower=snapshot.temp_lower,
+        temp_upper=snapshot.temp_upper,
+        box_count=snapshot.box_count,
+        normal_count=snapshot.normal_count,
+        out_of_range_count=snapshot.out_of_range_count,
+        missing_count=snapshot.missing_count,
+        created_at=snapshot.created_at,
+        items=[
+            schemas.HandoffItemOut(
+                box_code=item.box_code,
+                status=item.status,
+                seq=item.seq,
+                temperature=item.temperature,
+                event_time=item.event_time,
+            )
+            for item in items
+        ],
+    )
+
+
+@app.post(
+    "/handoffs",
+    tags=["handoffs"],
+    response_model=schemas.HandoffOut,
+    summary="创建交接快照（同一事务冻结各箱当前最大序号的状态，幂等）",
+)
+def post_handoff(
+    payload: schemas.HandoffIn, db: DbSession, response: Response
+) -> schemas.HandoffOut:
+    snapshot, items, created = services.create_handoff(db, payload)
+    # 新建 201；同编号同内容的重复请求 200，返回原快照
+    response.status_code = (
+        status.HTTP_201_CREATED if created else status.HTTP_200_OK
+    )
+    return _handoff_out(snapshot, items)
+
+
+@app.get(
+    "/handoffs/{handoff_code}",
+    tags=["handoffs"],
+    response_model=schemas.HandoffOut,
+    summary="交接快照的冻结明细与各类数量",
+)
+def get_handoff(handoff_code: str, db: DbSession) -> schemas.HandoffOut:
+    result = services.get_handoff(db, handoff_code.strip())
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "handoff_not_found", "handoff_code": handoff_code},
+        )
+    snapshot, items = result
+    return _handoff_out(snapshot, items)
 
 
 @app.get(

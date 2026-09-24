@@ -1,7 +1,7 @@
 """Pydantic 请求/响应模型。"""
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EventIn(BaseModel):
@@ -51,6 +51,81 @@ class BoxState(BaseModel):
 
 class BoxListItem(BaseModel):
     box_code: str
+
+
+class HandoffIn(BaseModel):
+    handoff_code: str = Field(
+        ..., min_length=1, max_length=64, description="交接编号，全局唯一，作为幂等键"
+    )
+    box_codes: list[str] = Field(
+        ..., min_length=1, description="参与交接的箱号列表，至少 1 个且不可重复"
+    )
+    temp_lower: float = Field(
+        ..., allow_inf_nan=False, description="温度下限（℃），边界值算正常"
+    )
+    temp_upper: float = Field(
+        ..., allow_inf_nan=False, description="温度上限（℃），边界值算正常"
+    )
+
+    @field_validator("handoff_code")
+    @classmethod
+    def _strip_handoff_code(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("handoff_code 不能为空")
+        return v
+
+    @field_validator("box_codes")
+    @classmethod
+    def _strip_and_check_box_codes(cls, v: list[str]) -> list[str]:
+        codes = [c.strip() for c in v]
+        if any(not c for c in codes):
+            raise ValueError("箱号不能为空")
+        if any(len(c) > 64 for c in codes):
+            raise ValueError("箱号长度不能超过 64 字符")
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for c in codes:
+            if c in seen and c not in duplicates:
+                duplicates.append(c)
+            seen.add(c)
+        if duplicates:
+            raise ValueError(f"箱号列表存在重复：{', '.join(duplicates)}")
+        return codes
+
+    @model_validator(mode="after")
+    def _check_limits(self) -> "HandoffIn":
+        if self.temp_lower > self.temp_upper:
+            raise ValueError(
+                f"温度下限({self.temp_lower})不能大于温度上限({self.temp_upper})"
+            )
+        return self
+
+
+class HandoffItemOut(BaseModel):
+    box_code: str
+    status: str = Field(
+        ..., description="冻结结论：normal=正常，out_of_range=越界，missing=缺报"
+    )
+    seq: int | None = Field(..., description="冻结时刻该箱最大事件序号；缺报为 null")
+    temperature: float | None = Field(..., description="冻结时刻的温度（℃）；缺报为 null")
+    event_time: datetime | None = Field(
+        ..., description="冻结时刻的 UTC 事件时间；缺报为 null"
+    )
+
+
+class HandoffOut(BaseModel):
+    handoff_code: str
+    temp_lower: float
+    temp_upper: float
+    box_count: int = Field(..., description="快照内箱号总数")
+    normal_count: int = Field(..., description="结论为正常的箱数")
+    out_of_range_count: int = Field(..., description="结论为越界的箱数")
+    missing_count: int = Field(..., description="结论为缺报的箱数")
+    created_at: datetime = Field(..., description="快照创建时间（UTC）")
+    items: list[HandoffItemOut] = Field(
+        ..., description="逐箱冻结明细，顺序与创建请求的箱号列表一致"
+    )
 
 
 class ClockAuditItem(BaseModel):

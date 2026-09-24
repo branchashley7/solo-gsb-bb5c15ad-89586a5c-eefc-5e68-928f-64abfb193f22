@@ -9,6 +9,9 @@
 - **乱序/延迟事件**（序号先到 3 后到 1、中间跳号等）→ 正常入库；
   查询“最新状态”时始终取每个箱子**序号最大**的一条，与到达顺序无关。
 
+此外支持**交接快照**：`POST /handoffs` 在同一事务中按各箱当前最大序号冻结状态与
+缺报/越界/正常结论；快照落库后只读，后续乱序补报不会改写已建快照。
+
 ## 目录结构
 
 ```
@@ -17,9 +20,9 @@
 │   ├── __init__.py
 │   ├── config.py          # 环境变量配置
 │   ├── database.py        # 引擎/会话，启动建表
-│   ├── models.py          # BoxEvent 模型，(box_code, seq) 唯一约束
+│   ├── models.py          # BoxEvent 与交接快照模型，(box_code, seq)、handoff_code 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -98,6 +101,8 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/boxes/{box_code}/temperature-median` | 区间按持续时间加权的温度中位数（线性插值 + 保序校正时间，不改原始记录） |
 | GET  | `/boxes/{box_code}/trajectory-compression` | 区间温度轨迹压缩预览（最少保留点 + 线性插值误差受限，只读不写回） |
 | GET  | `/boxes/{box_code}/merkle-proof` | 区间事件的 Merkle 包含证明（按 seq 升序建树，只读不写回） |
+| POST | `/handoffs`                     | 创建交接快照（同一事务冻结各箱当前最大序号的状态，幂等） |
+| GET  | `/handoffs/{handoff_code}`      | 交接快照的冻结明细与各类数量               |
 
 ### 上报事件
 
@@ -665,6 +670,105 @@ curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/merkle-proof?seq_from=0&seq_to=
 curl -i 'http://localhost:8000/boxes/BOX-MK/merkle-proof?seq_from=5&seq_to=2&target_seq=3'
 ```
 
+## 交接快照（handoffs）
+
+`POST /handoffs` 在**同一事务**中按各箱**当前最大 seq** 读取状态，把每箱的序号、温度、
+事件时间与结论**冻结**为一张交接快照；`GET /handoffs/{handoff_code}` 返回冻结明细与各类数量。
+快照落库后即为只读，**后续乱序补报不会改写已建快照**。
+服务经 `docker compose up -d --build` 启动后（见上文“一键启动”与“配置”），
+以下示例均访问 `http://localhost:8000`。
+
+请求体：
+
+```json
+{
+  "handoff_code": "HO-20260924-01",
+  "box_codes": ["BOX-001", "BOX-002", "BOX-003"],
+  "temp_lower": -8.0,
+  "temp_upper": 2.0
+}
+```
+
+字段与校验（不满足返回 `422`）：
+
+- `handoff_code`：交接编号，去空白后非空（≤64 字符），全局唯一，作为幂等键。
+- `box_codes`：箱号列表，**至少 1 个**；箱号去空白后非空（≤64 字符）且**不可重复**
+  （重复即 `422`，响应中指出重复项）。
+- `temp_lower` / `temp_upper`：温度下/上限（℃），须为**有限数值**（`NaN`/`Infinity` 拒绝）
+  且 `temp_lower <= temp_upper`。
+
+冻结结论（按冻结时刻各箱最大 seq 的事件温度判定）：
+
+- 箱号从未上报过 → `missing`（缺报），`seq` / `temperature` / `event_time` 为 `null`；
+- 温度**严格**越出 `[temp_lower, temp_upper]` → `out_of_range`（越界）；
+- 其余（含**恰等于上限或下限的边界值**）→ `normal`（正常）。
+
+幂等与冲突：
+
+- 交接编号相同且请求内容（箱号列表及顺序、温度上下限）一致 → 返回**原快照**
+  （`200`），不重新读取事件；
+- 交接编号相同但内容不同 → `409 Conflict`，响应体带已建快照与本次请求的内容，便于排查；
+- 新建成功 → `201 Created`。
+
+```bash
+# 先上报两条事件：BOX-001 正常（-4.5℃），BOX-002 越界（5.0℃）；BOX-003 不上报（缺报）
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-001","seq":0,"temperature":-4.5,"event_time":"2026-09-24T08:00:00+08:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-002","seq":0,"temperature":5.0,"event_time":"2026-09-24T08:00:00+08:00"}'
+
+# 创建交接快照（上下限 [-8, 2]）
+curl -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_code":"HO-20260924-01","box_codes":["BOX-001","BOX-002","BOX-003"],
+       "temp_lower":-8.0,"temp_upper":2.0}'
+```
+
+响应（`201`；BOX-001 正常、BOX-002 越界、BOX-003 缺报）：
+
+```json
+{
+  "handoff_code": "HO-20260924-01",
+  "temp_lower": -8.0,
+  "temp_upper": 2.0,
+  "box_count": 3,
+  "normal_count": 1,
+  "out_of_range_count": 1,
+  "missing_count": 1,
+  "created_at": "2026-09-24T00:12:34.567890",
+  "items": [
+    {"box_code": "BOX-001", "status": "normal", "seq": 0, "temperature": -4.5, "event_time": "2026-09-24T00:00:00"},
+    {"box_code": "BOX-002", "status": "out_of_range", "seq": 0, "temperature": 5.0, "event_time": "2026-09-24T00:00:00"},
+    {"box_code": "BOX-003", "status": "missing", "seq": null, "temperature": null, "event_time": null}
+  ]
+}
+```
+
+```bash
+# 同编号 + 同内容重发 -> 200，返回原快照
+curl -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_code":"HO-20260924-01","box_codes":["BOX-001","BOX-002","BOX-003"],
+       "temp_lower":-8.0,"temp_upper":2.0}'
+
+# 乱序补报更高序号也不会改写已建快照
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-001","seq":1,"temperature":20.0,"event_time":"2026-09-24T09:00:00+08:00"}'
+curl http://localhost:8000/handoffs/HO-20260924-01   # 仍是冻结时的 -4.5℃ / normal
+
+# 同编号但内容不同（改了上限）-> 409
+curl -i -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_code":"HO-20260924-01","box_codes":["BOX-001","BOX-002","BOX-003"],
+       "temp_lower":-8.0,"temp_upper":3.0}'
+
+# 查询不存在的交接编号 -> 404
+curl -i http://localhost:8000/handoffs/NO-SUCH-HANDOFF
+
+# 箱号重复 / 下限大于上限 -> 422
+curl -i -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_code":"HO-X","box_codes":["BOX-001","BOX-001"],"temp_lower":-8,"temp_upper":2}'
+curl -i -X POST http://localhost:8000/handoffs -H 'Content-Type: application/json' \
+  -d '{"handoff_code":"HO-Y","box_codes":["BOX-001"],"temp_lower":2,"temp_upper":-8}'
+```
+
 ## 设计说明
 
 - **去重键**：数据库对 `(box_code, seq)` 建唯一约束（`uq_box_seq`）。
@@ -702,6 +806,16 @@ curl -i 'http://localhost:8000/boxes/BOX-MK/merkle-proof?seq_from=5&seq_to=2&tar
   时间字符串与 `.17g` 温度字符串组成的无空格 JSON 数组（中文原样 UTF-8 编码），
   叶哈希 `SHA-256(0x00||数据)`、父哈希 `SHA-256(0x01||左||右)`、奇数层复制末节点；
   证明路径逐层给出兄弟哈希与左右方位，调用方可离线重算根。不写库，补报后重查即重算。
+- **交接快照冻结**：`POST /handoffs` 在同一事务中按“每箱 `MAX(seq)` 关联回原行”读取
+  各箱当前状态，把序号、温度、事件时间与结论（缺报/越界/正常，上下限边界值算正常）
+  复制到 `handoff_snapshots` / `handoff_snapshot_items` 两张表后一次提交；
+  `handoff_code` 有唯一约束，并发下同编号创建由 `IntegrityError` 兜底重判。
+  快照行只增不改，后续事件补报（含乱序）只写 `box_events`，不会触碰已建快照；
+  同编号同内容（箱号列表及顺序、温度上下限）的重复请求直接返回原快照，内容不同返回 409。
+- **校验错误兜底**：请求体携带 `NaN`/`Infinity` 时，校验错误的详情里会带上这些
+  非有限浮点，而 Starlette 的 JSON 响应不允许序列化它们；`main.py` 自定义了
+  `RequestValidationError` 处理器，先把错误详情中的 NaN/Inf 替换为字符串再返回 422，
+  避免 422 响应自身序列化失败变成 500。
 - **持久化**：默认 SQLite + WAL，卷挂载于 `/app/data`；
   如需 PostgreSQL/MySQL，只需将 `DATABASE_URL` 换成对应 SQLAlchemy 连接串
   （并安装相应驱动），建表逻辑通用。

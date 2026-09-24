@@ -1,4 +1,4 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照。"""
 import hashlib
 import json
 import math
@@ -15,6 +15,11 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 # 单次轨迹压缩预览允许读取的最大区间事件数，超过则拒绝（422）
 TRAJECTORY_COMPRESSION_MAX_EVENTS = 120
+
+# 交接快照逐箱结论取值
+HANDOFF_STATUS_NORMAL = "normal"
+HANDOFF_STATUS_OUT_OF_RANGE = "out_of_range"
+HANDOFF_STATUS_MISSING = "missing"
 
 
 def _content_equal(existing: models.BoxEvent, payload: schemas.EventIn) -> bool:
@@ -749,3 +754,170 @@ def trajectory_compression(
             for i in kept_idx
         ],
     )
+
+
+def _load_handoff(
+    db: Session, handoff_code: str
+) -> tuple[models.HandoffSnapshot, list[models.HandoffSnapshotItem]] | None:
+    """按交接编号读取快照头与冻结明细（按请求时的箱号顺序）；不存在返回 None。"""
+    snapshot = db.scalar(
+        select(models.HandoffSnapshot).where(
+            models.HandoffSnapshot.handoff_code == handoff_code
+        )
+    )
+    if snapshot is None:
+        return None
+    items = list(
+        db.scalars(
+            select(models.HandoffSnapshotItem)
+            .where(models.HandoffSnapshotItem.handoff_id == snapshot.id)
+            .order_by(models.HandoffSnapshotItem.position)
+        ).all()
+    )
+    return snapshot, items
+
+
+def _handoff_content_equal(
+    snapshot: models.HandoffSnapshot,
+    items: list[models.HandoffSnapshotItem],
+    payload: schemas.HandoffIn,
+) -> bool:
+    """已建快照与本次请求内容是否一致（温度上下限 + 箱号列表及顺序）。
+
+    设备/客户端重试会原样重发 JSON，float 解析结果相同，故上下限直接判等。
+    """
+    return (
+        snapshot.temp_lower == payload.temp_lower
+        and snapshot.temp_upper == payload.temp_upper
+        and [item.box_code for item in items] == payload.box_codes
+    )
+
+
+def _handoff_conflict(
+    payload: schemas.HandoffIn,
+    snapshot: models.HandoffSnapshot,
+    items: list[models.HandoffSnapshotItem],
+) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": "handoff_conflict",
+            "message": (
+                f"交接编号 {payload.handoff_code} 已建快照，"
+                "但本次请求的箱号列表或温度上下限与其不一致，已拒绝"
+            ),
+            "existing": {
+                "box_codes": [item.box_code for item in items],
+                "temp_lower": snapshot.temp_lower,
+                "temp_upper": snapshot.temp_upper,
+            },
+            "received": {
+                "box_codes": payload.box_codes,
+                "temp_lower": payload.temp_lower,
+                "temp_upper": payload.temp_upper,
+            },
+        },
+    )
+
+
+def create_handoff(
+    db: Session, payload: schemas.HandoffIn
+) -> tuple[models.HandoffSnapshot, list[models.HandoffSnapshotItem], bool]:
+    """创建交接快照：在同一事务中按各箱当前最大 seq 读取状态并冻结。
+
+    返回 (快照头, 冻结明细, 是否新建)。
+    - 交接编号不存在：同一事务内按“每箱当前最大 seq”读取状态，逐箱冻结
+      序号、温度、事件时间与结论（缺报/越界/正常；上下限边界值算正常）后一次提交
+    - 交接编号已存在且请求内容（箱号列表及顺序、温度上下限）一致：
+      幂等返回原快照，不重新读取事件、不改写任何冻结数据
+    - 交接编号已存在但内容不同：拒绝（409）
+    快照落库后即为只读：后续事件补报（含乱序）只写 box_events，不会改写已建快照。
+    """
+    existing = _load_handoff(db, payload.handoff_code)
+    if existing is not None:
+        snapshot, items = existing
+        if not _handoff_content_equal(snapshot, items, payload):
+            raise _handoff_conflict(payload, snapshot, items)
+        return snapshot, items, False
+
+    # 同一事务内按“每箱当前最大 seq”读取最新状态（乱序入库不影响取值）
+    latest = _latest_subquery()
+    rows = db.scalars(
+        select(models.BoxEvent)
+        .join(
+            latest,
+            (models.BoxEvent.box_code == latest.c.box_code)
+            & (models.BoxEvent.seq == latest.c.max_seq),
+        )
+        .where(models.BoxEvent.box_code.in_(payload.box_codes))
+    ).all()
+    states = {e.box_code: e for e in rows}
+
+    snapshot = models.HandoffSnapshot(
+        handoff_code=payload.handoff_code,
+        temp_lower=payload.temp_lower,
+        temp_upper=payload.temp_upper,
+        box_count=len(payload.box_codes),
+        normal_count=0,
+        out_of_range_count=0,
+        missing_count=0,
+    )
+    db.add(snapshot)
+    try:
+        db.flush()  # 取得 id，同时触发 handoff_code 唯一约束，兜住并发创建
+    except IntegrityError:
+        db.rollback()
+        # 并发请求已抢先建快照：以库中快照为准重新判定
+        existing = _load_handoff(db, payload.handoff_code)
+        if existing is None:  # 理论上不会发生
+            raise
+        snapshot, items = existing
+        if not _handoff_content_equal(snapshot, items, payload):
+            raise _handoff_conflict(payload, snapshot, items)
+        return snapshot, items, False
+
+    items: list[models.HandoffSnapshotItem] = []
+    normal = out_of_range = missing = 0
+    for position, box_code in enumerate(payload.box_codes):
+        event = states.get(box_code)
+        if event is None:
+            # 缺箱（从未上报过）记缺报，冻结字段为 NULL
+            item_status = HANDOFF_STATUS_MISSING
+            missing += 1
+            seq = temperature = event_time = None
+        else:
+            # 边界值（恰等于下限或上限）算正常，严格越出区间才算越界
+            if payload.temp_lower <= event.temperature <= payload.temp_upper:
+                item_status = HANDOFF_STATUS_NORMAL
+                normal += 1
+            else:
+                item_status = HANDOFF_STATUS_OUT_OF_RANGE
+                out_of_range += 1
+            seq = event.seq
+            temperature = event.temperature
+            event_time = event.event_time
+        items.append(
+            models.HandoffSnapshotItem(
+                handoff_id=snapshot.id,
+                position=position,
+                box_code=box_code,
+                status=item_status,
+                seq=seq,
+                temperature=temperature,
+                event_time=event_time,
+            )
+        )
+
+    snapshot.normal_count = normal
+    snapshot.out_of_range_count = out_of_range
+    snapshot.missing_count = missing
+    db.add_all(items)
+    db.commit()
+    return snapshot, items, True
+
+
+def get_handoff(
+    db: Session, handoff_code: str
+) -> tuple[models.HandoffSnapshot, list[models.HandoffSnapshotItem]] | None:
+    """按交接编号查询已冻结的快照与明细；不存在返回 None，由路由层转 404。"""
+    return _load_handoff(db, handoff_code)
